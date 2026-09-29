@@ -8,7 +8,7 @@ STARTED=time.time()
 CYCLE_LOCK=threading.Lock()
 CYCLES=[]
 WAKE=threading.Event()
-STATE={'last_poll':None,'last_error':None,'last_discovery':None,'research_error':None,'cycle_seconds':0,'mode':'paper-only','version':'3.1.0','project':'HermesPM.V2','poll_seconds':POLL,'effective_interval':POLL,'cycle_overruns':0,'worker_heartbeat':None}
+STATE={'last_poll':None,'last_error':None,'last_discovery':None,'research_error':None,'cycle_seconds':0,'mode':'paper-only','version':'3.1.1','project':'HermesPM.V2','poll_seconds':POLL,'effective_interval':POLL,'cycle_overruns':0,'worker_heartbeat':None}
 
 
 def collect(w,now):
@@ -89,15 +89,27 @@ def cycle():
 
 def reconcile():
     with e.LOCK,e.database() as db:
-        wallets=[dict(w) for w in db.execute('SELECT * FROM pm_wallets WHERE ready=1 AND enabled=1 AND last_reconcile<?',(int(time.time())-900,))]
+        wallets=[dict(w) for w in db.execute('SELECT * FROM pm_wallets WHERE ready=1 AND enabled=1 AND (last_reconcile<? OR (blocked=1 AND last_reconcile<?))',(int(time.time())-900,int(time.time())-300))]
     for w in wallets:
         try:
             observed=api.positions(w['address'])
             with e.LOCK,e.database() as db:
                 expected={r['asset']:r['qty'] for r in db.execute('SELECT * FROM pm_source WHERE address=?',(w['address'],)) if r['qty']>e.EPS}
+            missing={a for a,qty in expected.items() if qty>e.EPS and observed.get(a,0)<=e.EPS}
+            resolved=set()
+            for asset in missing:
+                try:
+                    if api.resolved_asset(asset):resolved.add(asset)
+                except Exception:
+                    # Leave uncertain inventory blocked; retry on the next reconciliation.
+                    pass
+            with e.LOCK,e.database() as db:
+                for asset in resolved:
+                    e.set_source(db,w['address'],asset,0)
+                    e.note(db,'source_resolved',w['address']+' '+asset+'; official final resolution, public position absent')
+                expected={r['asset']:r['qty'] for r in db.execute('SELECT * FROM pm_source WHERE address=?',(w['address'],)) if r['qty']>e.EPS}
                 diff={a:(expected.get(a,0),observed.get(a,0)) for a in expected.keys()|observed.keys() if abs(expected.get(a,0)-observed.get(a,0))>max(.01,observed.get(a,0)*.001)}
                 if diff:
-                    # Snapshot can race incoming trades; block entries, don't fabricate exits.
                     db.execute('UPDATE pm_wallets SET blocked=1,error=? WHERE address=?',('diferencia de inventario; entradas pausadas hasta reconciliar',w['address']))
                     e.note(db,'reconcile_difference',json.dumps({'address':w['address'],'differences':dict(list(diff.items())[:10])}))
                 elif not db.execute('SELECT 1 FROM pm_meta WHERE k=?',('strategy_block:'+w['address'],)).fetchone():

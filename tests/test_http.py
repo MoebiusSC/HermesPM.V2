@@ -1,9 +1,30 @@
 import http.client,json,os,sys,tempfile,threading,unittest
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).parents[1]))
-import app,engine as e
+import app,engine as e,service
+from unittest.mock import patch
 
 class HttpTest(unittest.TestCase):
+    def test_reconcile_only_clears_verified_resolved_inventory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            old=e.DB;e.DB=str(Path(temp)/'db.sqlite3')
+            try:
+                e.init();address='0x'+'a'*40
+                with e.database() as db:
+                    e.add_wallet(db,address,'Alpha',True)
+                    db.execute('UPDATE pm_wallets SET ready=1,blocked=1,last_reconcile=0 WHERE address=?',(address,))
+                    e.set_source(db,address,'123',10)
+                with patch.object(service.api,'positions',return_value={}),patch.object(service.api,'resolved_asset',return_value=False):
+                    service.reconcile()
+                with e.database() as db:
+                    self.assertEqual(db.execute('SELECT blocked FROM pm_wallets').fetchone()[0],1)
+                    db.execute('UPDATE pm_wallets SET last_reconcile=0')
+                with patch.object(service.api,'positions',return_value={}),patch.object(service.api,'resolved_asset',return_value=True):
+                    service.reconcile()
+                with e.database() as db:
+                    self.assertEqual(db.execute('SELECT blocked FROM pm_wallets').fetchone()[0],0)
+                    self.assertEqual(e.source_qty(db,address,'123'),0)
+            finally:e.DB=old
     def test_auth_add_state_and_backup(self):
         with tempfile.TemporaryDirectory() as temp:
             e.DB=str(Path(temp)/'db.sqlite3');e.init();os.environ['HERMES_PM_KEY']='test-only'

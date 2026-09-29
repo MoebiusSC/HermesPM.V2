@@ -29,6 +29,18 @@ class ProviderTest(unittest.TestCase):
         def fake(host,path,params=None):return [market] if host==p.GAMMA else {'asks':[{'price':'.5','size':'40'}],'bids':[{'price':'.49','size':'30'}],'timestamp':int(time.time()*1000)}
         with patch.object(p,'get',side_effect=fake):
             q=p.quote('123','c');self.assertEqual(q['fee_rate'],.07);self.assertEqual(q['asks'],[[.5,40.]])
+    def test_closed_market_fallback_and_final_token_check(self):
+        closed={'conditionId':'c','closed':True,'umaResolutionStatus':'resolved',
+                'clobTokenIds':'["111","222"]','outcomePrices':'["0","1"]','feesEnabled':False}
+        def fake(host,path,params=None,**kwargs):
+            if host==p.GAMMA:return [closed] if params.get('closed')=='true' else []
+            raise AssertionError('settled asset should not request an orderbook')
+        with patch.object(p,'get',side_effect=fake):
+            self.assertEqual(p.quote('222','c')['settlement'],1)
+            self.assertTrue(p.resolved_asset('222'))
+            self.assertFalse(p.resolved_asset('333'))
+            closed['umaResolutionStatus']='proposed'
+            self.assertFalse(p.resolved_asset('222'))
     def test_pagination_cap_reported(self):
         with patch.object(p,'get',return_value=[{'a':1}]*100):
             with self.assertRaises(ValueError):p.trades('address',100,200)

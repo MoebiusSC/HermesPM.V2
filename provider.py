@@ -10,16 +10,25 @@ _cache={};_lock=threading.Lock()
 
 # Global request budget across polling and research; no burst on retries.
 _requests=collections.deque()
+_research_requests=collections.deque()
 _cooldowns={}
 METRICS={'requests':0,'errors':0,'throttles':0}
-def get(host,path,params=None):
+def get(host,path,params=None,research=False):
     url=host+path+('?' + urllib.parse.urlencode(params or {},doseq=True) if params else '')
-    with _lock:
-        now=time.monotonic()
-        while _requests and _requests[0]<now-10:_requests.popleft()
-        if now<_cooldowns.get(host,0):raise RuntimeError('API cooldown; retry next cycle')
-        if len(_requests)>=80:raise RuntimeError('local request budget; retry next cycle')
-        _requests.append(now);METRICS['requests']+=1
+    while True:
+        with _lock:
+            now=time.monotonic()
+            while _requests and _requests[0]<now-10:_requests.popleft()
+            while _research_requests and _research_requests[0]<now-10:_research_requests.popleft()
+            cooldown=_cooldowns.get(host,0)-now
+            budget=len(_requests)>=80 or (research and len(_research_requests)>=20)
+            if cooldown<=0 and not budget:
+                _requests.append(now)
+                if research:_research_requests.append(now)
+                METRICS['requests']+=1
+                break
+        if not research:raise RuntimeError('local request budget or API cooldown; retry next cycle')
+        time.sleep(max(.1,min(1,cooldown if cooldown>0 else 1)))
     req=urllib.request.Request(url,headers={'User-Agent':'HermesPM-V2/3.0','Accept':'application/json'})
     try:
         with urllib.request.urlopen(req,timeout=4) as response:return json.load(response)
@@ -43,10 +52,10 @@ def listing(value):
     raise ValueError('unexpected API schema')
 
 
-def paged(path,params,size=100,pages=10):
+def paged(path,params,size=100,pages=10,research=False):
     rows=[]
     for page in range(pages):
-        part=listing(get(DATA,path,{**params,'limit':size,'offset':page*size}))
+        part=listing(get(DATA,path,{**params,'limit':size,'offset':page*size},research=research))
         rows.extend(part)
         if len(part)<size: return rows,True
     return rows,False
@@ -92,7 +101,7 @@ def market_risk(m,condition):
     return dict(event=event,neg_risk=neg,complex=bool(reason),risk_reason=reason)
 
 def discovery():
-    def batch(offset): return listing(get(DATA,'/v1/leaderboard',{'category':'OVERALL','timePeriod':'MONTH','orderBy':'PNL','limit':50,'offset':offset}))
+    def batch(offset): return listing(get(DATA,'/v1/leaderboard',{'category':'OVERALL','timePeriod':'MONTH','orderBy':'PNL','limit':50,'offset':offset},research=True))
     with ThreadPoolExecutor(max_workers=4) as pool:
         batches=list(pool.map(batch,[0,50,100,150]))
     unique={str(w['proxyWallet']).lower():w for rows in batches for w in rows}
@@ -101,9 +110,9 @@ def discovery():
 
 def evaluate(w):
     address=str(w['proxyWallet']).lower()
-    closed,complete=paged('/closed-positions',{'user':address,'sortBy':'TIMESTAMP','sortDirection':'DESC'},50,6)
+    closed,complete=paged('/closed-positions',{'user':address,'sortBy':'TIMESTAMP','sortDirection':'DESC'},50,6,research=True)
     # Never interpret a truncated open portfolio as complete evidence.
-    opened,open_complete=paged('/positions',{'user':address,'sizeThreshold':0},500,10)
+    opened,open_complete=paged('/positions',{'user':address,'sizeThreshold':0},500,10,research=True)
     values=[float(x.get('realizedPnl') or 0) for x in closed]
     stamps=[int(x.get('timestamp') or 0) for x in closed if x.get('timestamp')]
     profits=sum(max(v,0) for v in values);losses=-sum(min(v,0) for v in values)
@@ -127,6 +136,10 @@ def metadata(condition):
         if hit and time.time()-hit[0]<300:return hit[1]
     rows=listing(get(GAMMA,'/markets',{'condition_ids':condition}))
     match=next((m for m in rows if m.get('conditionId')==condition),None)
+    if not match:
+        # Gamma hides closed markets from its default listing.
+        closed=listing(get(GAMMA,'/markets',{'condition_ids':condition,'closed':'true'}))
+        match=next((m for m in closed if m.get('conditionId')==condition),None)
     if not match: raise ValueError('market metadata unavailable')
     with _lock:_cache[condition]=(time.time(),match)
     return match
@@ -134,6 +147,20 @@ def metadata(condition):
 
 def read_list(value):
     return json.loads(value) if isinstance(value,str) else (value or [])
+
+
+def resolved_asset(asset):
+    """Authoritatively identify a redeemed token absent from a source snapshot."""
+    rows=listing(get(GAMMA,'/markets',{'clob_token_ids':asset,'closed':'true'}))
+    for m in rows:
+        tokens=read_list(m.get('clobTokenIds'))
+        payouts=read_list(m.get('outcomePrices'))
+        if not (m.get('closed') is True and str(m.get('umaResolutionStatus','')).lower()=='resolved'
+                and asset in tokens and len(tokens)==len(payouts)):continue
+        try:values=[float(x) for x in payouts]
+        except (ValueError,TypeError):continue
+        if all(x in (0.,.5,1.) for x in values) and abs(sum(values)-1)<1e-6:return True
+    return False
 
 
 def quote(asset,condition):
