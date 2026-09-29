@@ -13,7 +13,7 @@ def state():
         portfolios=e.portfolios(db,now)
         stats={p:dict(db.execute('SELECT COUNT(*) fills,COALESCE(SUM(CASE side WHEN \'SELL\' THEN 1 ELSE 0 END),0) exits,AVG(ts-source_ts) latency FROM pm_fills WHERE portfolio=?',(p,)).fetchone()) for p in e.POLICIES}
         for p in portfolios:p.update(stats[p['id']])
-        return dict(status=dict(service.STATE),telemetry=telemetry(db,now),portfolios=portfolios,
+        return dict(ranked_selection=e.ranked_wallets(db,now),status=dict(service.STATE),telemetry=telemetry(db,now),portfolios=portfolios,
             wallets=[dict(x) for x in db.execute('SELECT * FROM pm_wallets ORDER BY added DESC')],
             candidates=[dict(x) for x in db.execute('SELECT * FROM pm_candidates ORDER BY eligible DESC,score DESC,pnl DESC LIMIT 200')],
             orders=[dict(x) for x in db.execute('SELECT * FROM pm_orders ORDER BY created DESC LIMIT 200')],

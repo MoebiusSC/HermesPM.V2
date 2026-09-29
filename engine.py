@@ -12,7 +12,7 @@ from pathlib import Path
 DB = os.getenv('DB_PATH', '/data/hermes_pm_v2.sqlite3' if Path('/data').exists() else 'hermes_pm_v2.sqlite3')
 LOCK = threading.RLock()
 START = float(os.getenv('START_CASH', '1000'))
-POLICIES = ('reference', 'filtered', 'adaptive')
+POLICIES = ('reference', 'filtered', 'adaptive', 'ranked')
 LIMITS = dict(trade=25., wallet=200., market=75., event=125., total=600., positions=20,
               spread=.06, relative=.05, absolute=.02, max_age=180, daily_loss=.05)
 EPS = 1e-8
@@ -61,7 +61,7 @@ def init():
         CREATE INDEX IF NOT EXISTS pm_signals_time ON pm_signals(detected);
         ''')
         db.execute('CREATE TABLE IF NOT EXISTS pm_runs(version TEXT PRIMARY KEY,started INTEGER,config TEXT)')
-        db.execute('INSERT OR IGNORE INTO pm_runs VALUES(?,?,?)',('3.0.0',int(time.time()),json.dumps(dict(limits=LIMITS,poll_seconds=max(5,int(os.getenv('POLL_SECONDS','5'))),wallet_fraction=.10),sort_keys=True)))
+        db.execute('INSERT OR IGNORE INTO pm_runs VALUES(?,?,?)',('3.1.0',int(time.time()),json.dumps(dict(limits=LIMITS,poll_seconds=max(5,int(os.getenv('POLL_SECONDS','5'))),wallet_fraction=.10),sort_keys=True)))
         if not db.execute("SELECT 1 FROM pm_meta WHERE k='version'").fetchone():
             now = int(time.time())
             for p in POLICIES:
@@ -83,6 +83,18 @@ def init():
             db.execute("INSERT INTO pm_meta VALUES('version','2.0.0')")
             db.execute("INSERT INTO pm_meta VALUES('automation','1')")
             note(db,'migration','V2 initialized. Legacy tables retained; forward-only paper ledgers.')
+
+        # Add the new ledger once, preserving all existing balances and history.
+        now=int(time.time())
+        db.execute('INSERT OR IGNORE INTO pm_portfolios(id,initial,cash,peak,created) VALUES(?,?,?,?,?)',('ranked',START,START,START,now))
+
+
+def ranked_wallets(db,now):
+    return [dict(r) for r in db.execute("""SELECT w.address,w.label,c.score,c.updated FROM pm_wallets w
+        JOIN pm_candidates c ON c.address=w.address
+        WHERE w.enabled=1 AND w.auto=1 AND w.ready=1 AND w.blocked=0 AND w.error=''
+        AND c.sample_count>0 AND c.updated>=?
+        ORDER BY c.score DESC,w.address ASC LIMIT 3""",(now-7*86400,))]
 
 
 def add_wallet(db,address,label,auto=False,origin='manual',now=None):
@@ -128,10 +140,13 @@ def signal(db,w,t,now):
         if side=='BUY':
             if not w['auto'] or not w['enabled'] or w['blocked']: continue
             if now-ts>LIMITS['max_age']: continue
+            if p=='ranked':
+                started=db.execute("SELECT created FROM pm_portfolios WHERE id='ranked'").fetchone()[0]
+                if ts<=started or address not in {x['address'] for x in ranked_wallets(db,now)}:continue
             # Scale shares, not arbitrary equal dollar bets. Each wallet uses a 1% base ratio.
             scale=.01*(w['weight'] if p=='adaptive' else 1.)
             target=min(qty*scale,LIMITS['trade']/price)
-            if p!='reference':
+            if p in ('filtered','adaptive'):
                 probe=dict(portfolio=p,address=address,market=market,event=event)
                 if room(db,probe)<1:
                     continue  # Signal retained; avoid redundant unfillable orders.
@@ -158,7 +173,7 @@ def room(db,o):
     totals['total']=db.execute('SELECT COALESCE(SUM(cost),0) FROM pm_positions WHERE portfolio=? AND qty>?',(p,EPS)).fetchone()[0]
     cash=db.execute('SELECT cash FROM pm_portfolios WHERE id=?',(p,)).fetchone()[0]
     caps=dict(LIMITS)
-    if p!='reference':
+    if p in ('filtered','adaptive'):
         initial=db.execute('SELECT initial FROM pm_portfolios WHERE id=?',(p,)).fetchone()[0]
         caps['wallet']=min(caps['wallet'],initial*.10)
     return max(0.,min([cash]+[caps[k]-v for k,v in totals.items()]))
@@ -206,13 +221,15 @@ def execute(db,o,quote,now):
     w=db.execute('SELECT * FROM pm_wallets WHERE address=?',(o['address'],)).fetchone()
     if o['side']=='BUY' and (not w or not w['auto'] or not w['enabled'] or w['blocked']):
         db.execute("UPDATE pm_orders SET state='cancelled',reason='entradas pausadas' WHERE id=?",(o['id'],)); return
+    if o['side']=='BUY' and o['portfolio']=='ranked' and o['address'] not in {x['address'] for x in ranked_wallets(db,now)}:
+        db.execute("UPDATE pm_orders SET state='cancelled',reason='wallet fuera del Top 3 vigente' WHERE id=?",(o['id'],));return
     if quote.get('settlement') is not None: return
     if quote.get('fee_rate') is None:
         db.execute("UPDATE pm_orders SET reason='comisión no verificada; sin ejecución' WHERE id=?",(o['id'],)); return
     if o['side']=='BUY' and w['error']:
         db.execute("UPDATE pm_orders SET reason='lectura de wallet incompleta; esperando validación' WHERE id=?",(o['id'],));return
     asks=quote.get('asks',[]); bids=quote.get('bids',[])
-    side=o['side']; filtered=o['portfolio']!='reference'
+    side=o['side']; filtered=o['portfolio'] in ('filtered','adaptive')
     if side=='BUY':
         if not asks or not bids: return
         if quote.get('complex'):
@@ -221,7 +238,7 @@ def execute(db,o,quote,now):
         if filtered and spread>LIMITS['spread']:
             db.execute("UPDATE pm_orders SET reason='spread excesivo' WHERE id=?",(o['id'],)); return
         # Pause new exposure when any current position cannot be valued.
-        if o['portfolio']!='reference' and not next(p for p in portfolios(db,now) if p['id']==o['portfolio'])['complete']:
+        if o['portfolio'] in ('filtered','adaptive') and not next(p for p in portfolios(db,now) if p['id']==o['portfolio'])['complete']:
             db.execute("UPDATE pm_orders SET reason='valoración incompleta; entradas pausadas' WHERE id=?",(o['id'],));return
         # Portfolio-level daily stop pauses entries, never exits.
         day=now-now%86400

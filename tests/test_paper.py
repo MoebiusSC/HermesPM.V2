@@ -20,6 +20,8 @@ class PaperTest(unittest.TestCase):
         w=dict(db.execute('SELECT * FROM pm_wallets WHERE address=?',(address or self.address,)).fetchone());e.signal(db,w,t,self.now)
     def execute_all(self,db,quote=None,p='filtered'):
         q=copy.deepcopy(quote or self.quote())
+        for row in db.execute("SELECT DISTINCT asset FROM pm_orders WHERE state='pending'").fetchall():
+            db.execute('INSERT OR REPLACE INTO pm_quotes VALUES(?,?,?,?)',(row['asset'],q['ts'],json.dumps(q),''))
         for row in db.execute("SELECT * FROM pm_orders WHERE portfolio=? AND state='pending' ORDER BY created,id",(p,)).fetchall():e.execute(db,dict(row),q,self.now)
     def test_minimum_order_size_blocks_dust(self):
         with e.database() as db:
@@ -114,6 +116,7 @@ class PaperTest(unittest.TestCase):
     def test_unknown_valuation_not_zero_profit(self):
         with e.database() as db:
             self.register(db,self.trade());self.execute_all(db)
+            db.execute('DELETE FROM pm_quotes')
             p=next(p for p in e.portfolios(db,self.now) if p['id']=='filtered')
             self.assertIsNone(p['equity']);self.assertFalse(p['complete'])
     def test_restart_keeps_cash_and_positions(self):

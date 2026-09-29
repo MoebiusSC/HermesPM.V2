@@ -8,7 +8,7 @@ STARTED=time.time()
 CYCLE_LOCK=threading.Lock()
 CYCLES=[]
 WAKE=threading.Event()
-STATE={'last_poll':None,'last_error':None,'last_discovery':None,'research_error':None,'cycle_seconds':0,'mode':'paper-only','version':'3.0.0','project':'HermesPM.V2','poll_seconds':POLL,'effective_interval':POLL,'cycle_overruns':0,'worker_heartbeat':None}
+STATE={'last_poll':None,'last_error':None,'last_discovery':None,'research_error':None,'cycle_seconds':0,'mode':'paper-only','version':'3.1.0','project':'HermesPM.V2','poll_seconds':POLL,'effective_interval':POLL,'cycle_overruns':0,'worker_heartbeat':None}
 
 
 def collect(w,now):
@@ -114,7 +114,8 @@ def discover():
             a=str(w['proxyWallet']).lower()
             db.execute('INSERT INTO pm_candidates VALUES(?,?,?,?,0,0,0,1,0,?,?) ON CONFLICT(address) DO UPDATE SET pnl=excluded.pnl,volume=excluded.volume,label=excluded.label', (a,str(w.get('userName') or a[:10])[:60],float(w.get('pnl') or 0),float(w.get('vol') or 0),'pendiente de evaluación; ranking mensual',now))
         # Rotate evaluations so every discovered candidate is eventually reviewed.
-        addresses={r[0] for r in db.execute('SELECT address FROM pm_candidates ORDER BY CASE sample_count WHEN 0 THEN 0 ELSE 1 END,updated ASC LIMIT 10')}
+        addresses={r[0] for r in db.execute("SELECT c.address FROM pm_candidates c LEFT JOIN pm_wallets w ON w.address=c.address ORDER BY CASE WHEN w.enabled=1 THEN 0 ELSE 1 END,c.updated ASC LIMIT 10")}
+        addresses.update(r[0] for r in db.execute("SELECT address FROM pm_candidates WHERE address NOT IN (SELECT address FROM pm_wallets WHERE enabled=1) ORDER BY updated ASC LIMIT 5"))
         selected=[dict(proxyWallet=r['address'],userName=r['label'],pnl=r['pnl'],vol=r['volume']) for r in db.execute('SELECT * FROM pm_candidates') if r['address'] in addresses]
     with ThreadPoolExecutor(max_workers=2) as pool:
         jobs=[pool.submit(api.evaluate,w) for w in selected]
