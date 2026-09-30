@@ -294,7 +294,7 @@ def settle(db,asset,payout,now):
 def portfolios(db,now,snapshot=False):
     out=[]
     for r in db.execute('SELECT * FROM pm_portfolios').fetchall():
-        p=dict(r); positions=[]; value=cost=0.;complete=True; remaining_books={}
+        p=dict(r); positions=[]; value=cost=0.;complete=True; remaining_books={};issues={}
         for row in db.execute('SELECT * FROM pm_positions WHERE portfolio=? AND qty>?',(p['id'],EPS)).fetchall():
             item=dict(row);q=db.execute('SELECT * FROM pm_quotes WHERE asset=?',(item['asset'],)).fetchone()
             quote=json.loads(q['payload']) if q else {}; fresh=bool(q and now-q['ts']<=120 and not q['error'])
@@ -303,7 +303,17 @@ def portfolios(db,now,snapshot=False):
             # Valuation requires enough visible depth for this position; stale/missing -> unknown.
             qty,n,f=consume(bids,'SELL',item['qty'],float('inf'),fee_rate or 0,quote.get('fee_exponent',1),0)
             good=fresh and fee_rate is not None and qty>=item['qty']-EPS
-            item.update(scheduled_end=quote.get('scheduled_end'),resolution_status=quote.get('resolution_status',''),market_closed=quote.get('market_closed',False),mark=mark,value=n-f if good else None,unrealized=n-f-item['cost'] if good else None,quote_ts=q['ts'] if q else None,liquidatable_shares=qty if fresh else 0)
+            if good:reason=None
+            elif q and q['error'] and 'stale orderbook timestamp' in q['error']:reason='Libro de órdenes sin actualización'
+            elif q and q['error']:reason='Fallo al actualizar la cotización'
+            elif not q:reason='Sin cotización registrada'
+            elif not fresh:reason='Cotización antigua'
+            elif quote.get('market_closed'):reason='Mercado cerrado; resolución pendiente'
+            elif fee_rate is None:reason='Comisión sin verificar'
+            elif not bids:reason='Sin ofertas de compra'
+            else:reason='Profundidad de compra insuficiente'
+            if reason:issues[reason]=issues.get(reason,0)+1
+            item.update(scheduled_end=quote.get('scheduled_end'),resolution_status=quote.get('resolution_status',''),market_closed=quote.get('market_closed',False),mark=mark,value=n-f if good else None,unrealized=n-f-item['cost'] if good else None,quote_ts=q['ts'] if q else None,liquidatable_shares=qty if fresh else 0,valuation_reason=reason)
             if good:
                 value+=n-f
                 left=qty
@@ -317,7 +327,8 @@ def portfolios(db,now,snapshot=False):
             peak=max(p['peak'],equity);dd=max(p['drawdown'],(peak-equity)/peak if peak else 0)
             if snapshot: db.execute('UPDATE pm_portfolios SET peak=?,drawdown=? WHERE id=?',(peak,dd,p['id']))
             p['peak']=peak;p['drawdown']=dd
-        p.update(equity=equity,total_pnl=equity-p['initial'] if complete else None,unrealized=value-cost if complete else None,complete=complete,positions=positions)
+        last=db.execute('SELECT ts,equity FROM pm_equity WHERE portfolio=? AND complete=1 ORDER BY ts DESC LIMIT 1',(p['id'],)).fetchone() if not complete else None
+        p.update(equity=equity,total_pnl=equity-p['initial'] if complete else None,unrealized=value-cost if complete else None,complete=complete,positions=positions,valuation_issues=issues,last_complete_equity=last['equity'] if last else None,last_complete_ts=last['ts'] if last else None)
         if snapshot:
             stamp=now-now%60
             db.execute('INSERT OR REPLACE INTO pm_equity VALUES(?,?,?,?,?,?,?)',(stamp,p['id'],p['cash'],equity,p['realized'],value-cost if complete else None,int(complete)))

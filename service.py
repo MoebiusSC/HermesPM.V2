@@ -58,13 +58,15 @@ def cycle():
                     # Failed collection doesn't move watermark; retry safely next cycle.
     with e.LOCK,e.database() as db:
         assets={r['asset']:r['market'] for r in db.execute("SELECT asset,market FROM pm_orders WHERE state='pending' UNION SELECT asset,market FROM pm_positions WHERE qty>?",(e.EPS,))}
-    quotes={}
+    quotes={};quote_errors={}
     with ThreadPoolExecutor(max_workers=8) as pool:
         jobs={pool.submit(api.quote,a,c):a for a,c in assets.items()}
         for f in as_completed(jobs):
             asset=jobs[f]
             try:quotes[asset]=f.result()
-            except Exception as exc:errors.append('quote '+asset[:8]+': '+str(exc)[:100])
+            except Exception as exc:
+                quote_errors[asset]=str(exc)[:160]
+                errors.append('quote '+asset[:8]+': '+str(exc)[:100])
     now=int(time.time())
     with e.LOCK,e.database() as db:
         for asset in assets:
@@ -75,7 +77,8 @@ def cycle():
                 db.execute('UPDATE pm_positions SET event=? WHERE asset=?',(q['event'],asset))
                 db.execute('UPDATE pm_orders SET event=? WHERE asset=?',(q['event'],asset))
                 if q['settlement'] is not None:e.settle(db,asset,q['settlement'],now)
-            else:db.execute("UPDATE pm_quotes SET error='quote refresh failed' WHERE asset=?",(asset,))
+            else:
+                db.execute("INSERT INTO pm_quotes(asset,ts,payload,error) VALUES(?,?,?,?) ON CONFLICT(asset) DO UPDATE SET error=excluded.error",(asset,0,'{}',quote_errors.get(asset,'quote refresh failed')))
         for p in e.POLICIES:
             available=copy.deepcopy(quotes)
             orders=db.execute("SELECT * FROM pm_orders WHERE portfolio=? AND state='pending' ORDER BY CASE side WHEN 'SELL' THEN 0 ELSE 1 END,created,id",(p,)).fetchall()
